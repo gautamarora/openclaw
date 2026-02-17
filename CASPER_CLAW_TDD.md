@@ -18,9 +18,9 @@ Casper Claw is a personal AI assistant that runs as a WhatsApp bot, built on the
 |---|---|
 | Gateway (message routing + lifecycle) | Simplified gateway (Baileys connection + message dispatch) |
 | Heartbeat (periodic background agent turns) | Heartbeat runner (interval timer + HEARTBEAT.md) |
-| Memory (vector search + markdown files) | Memory system (SQLite + embeddings + markdown) |
+| Memory (vector search + markdown files) | Markdown files + lazy embedding index |
 | Pi runtime (agent loop + tools + streaming) | Same — `pi-coding-agent` + `pi-ai` |
-| Session persistence (JSONL transcripts) | Same — `SessionManager` from `pi-coding-agent` |
+| Session persistence (JSONL transcripts) | Delegate to `SessionManager` from `pi-coding-agent` |
 | System prompt (identity + context injection) | Simplified system prompt builder |
 | Tools (structured LLM tool calls) | TypeScript SDK tools (not CLI wrappers) |
 
@@ -59,7 +59,7 @@ Casper Claw is a personal AI assistant that runs as a WhatsApp bot, built on the
 │                                          │           │
 │                                    ┌─────┴─────┐    │
 │                                    │  Memory    │    │
-│                                    │  (SQLite)  │    │
+│                                    │ (md files) │    │
 │                                    └───────────┘    │
 │                                                      │
 └─────────────────────────────────────────────────────┘
@@ -73,8 +73,8 @@ casper-claw (main process)
 ├── @mariozechner/pi-coding-agent    # Agent session, SessionManager
 ├── @mariozechner/pi-ai              # LLM streaming (streamSimple)
 ├── @mariozechner/pi-agent-core      # Agent types, events
-├── better-sqlite3                   # Memory index storage
-├── openai                           # Embeddings + image gen SDK
+├── better-sqlite3                   # Memory embedding index
+├── openai                           # Embeddings SDK
 │
 ├── SDK integrations (per config):
 │   ├── octokit                      # GitHub
@@ -114,12 +114,8 @@ casper-claw/
 │   │   ├── visibility.ts            # Suppress/deliver logic
 │   │   └── active-hours.ts          # Quiet hours check
 │   ├── memory/
-│   │   ├── manager.ts               # SQLite index manager
-│   │   ├── search.ts                # Hybrid vector + BM25 search
-│   │   ├── embeddings.ts            # Embedding provider abstraction
-│   │   ├── chunker.ts               # Markdown → chunks
-│   │   ├── sync.ts                  # File watcher + reindex
-│   │   └── tools.ts                 # memory_search, memory_get tools
+│   │   ├── indexer.ts               # Chunk, embed, store, search (single file)
+│   │   └── tools.ts                 # memory_search, memory_get tool defs
 │   ├── tools/
 │   │   ├── exec.ts                  # Shell execution tool
 │   │   ├── fs.ts                    # Read, write, edit tools
@@ -128,8 +124,7 @@ casper-claw/
 │   │   ├── notion.ts                # Notion tool
 │   │   └── index.ts                 # Tool registry + assembly
 │   └── sessions/
-│       ├── manager.ts               # Session file read/write
-│       └── history.ts               # History limiting + compaction
+│       └── sessions.ts              # Session file path resolution + reset logic
 ├── casper.json                      # Configuration file
 ├── workspace/
 │   ├── AGENTS.md                    # Agent operating instructions
@@ -206,33 +201,8 @@ type CasperConfig = {
   // Memory
   memory: {
     enabled: boolean;                    // true
-    embedding: {
-      provider: "openai" | "local";      // Embedding provider
-      model?: string;                    // "text-embedding-3-small"
-      apiKey?: string;                   // Or use env OPENAI_API_KEY
-    };
-    store: {
-      path: string;                      // "./memory.sqlite"
-    };
-    chunking: {
-      tokens: number;                    // 400
-      overlap: number;                   // 80
-    };
-    search: {
-      maxResults: number;                // 6
-      minScore: number;                  // 0.35
-      hybrid: {
-        enabled: boolean;                // true
-        vectorWeight: number;            // 0.7
-        textWeight: number;              // 0.3
-      };
-    };
-    sync: {
-      onSessionStart: boolean;           // true
-      onSearch: boolean;                  // true
-      watch: boolean;                    // true
-      watchDebounceMs: number;           // 1500
-    };
+    dir: string;                         // "./workspace/memory" — where .md files live
+    embeddingModel?: string;             // "text-embedding-3-small" (uses OPENAI_API_KEY from env)
   };
 
   // Tools — which SDK integrations to enable
@@ -308,23 +278,7 @@ type CasperConfig = {
   },
   "memory": {
     "enabled": true,
-    "embedding": {
-      "provider": "openai",
-      "model": "text-embedding-3-small"
-    },
-    "store": { "path": "./memory.sqlite" },
-    "chunking": { "tokens": 400, "overlap": 80 },
-    "search": {
-      "maxResults": 6,
-      "minScore": 0.35,
-      "hybrid": { "enabled": true, "vectorWeight": 0.7, "textWeight": 0.3 }
-    },
-    "sync": {
-      "onSessionStart": true,
-      "onSearch": true,
-      "watch": true,
-      "watchDebounceMs": 1500
-    }
+    "dir": "./workspace/memory"
   },
   "tools": {
     "profile": "coding",
@@ -698,26 +652,7 @@ function buildSystemPrompt(config: CasperConfig): string {
 
 ### 5.3 Context Management
 
-Follow OpenClaw's approach: context window guard + auto-compaction + pre-compaction memory flush.
-
-```
-On each agent run:
-  1. Check context window guard
-     - Warn below 8000 tokens remaining
-     - Hard-fail below 1000 tokens
-  2. If context overflow during LLM call:
-     a. Trigger pre-compaction memory flush
-        - Silent agentic turn: "Store durable memories now"
-        - Agent writes to memory/YYYY-MM-DD.md
-     b. Compact session history (summarize old turns)
-     c. Retry the prompt
-  3. If compaction still overflows:
-     - Truncate oversized tool results in history
-     - Retry once more
-  4. If still overflows:
-     - Return error to user: "Session too long, resetting."
-     - Reset session
-```
+Delegated to `pi-coding-agent`'s built-in compaction. The gateway adds a pre-compaction memory flush hook (see Section 9.5) so memories are preserved before old turns are summarized. If compaction fails, the session is reset.
 
 ---
 
@@ -780,14 +715,14 @@ Spawns a child process with configurable timeout. Captures stdout + stderr. Work
 #### Memory Tools (`src/memory/tools.ts`)
 
 ```typescript
-// memory_search: Semantic + keyword search over memory files
-{ name: "memory_search", params: { query: string, maxResults?: number } }
+// memory_search: Vector search over memory markdown files
+{ name: "memory_search", params: { query: string } }
 
-// memory_get: Read a specific memory file
+// memory_get: Read a specific memory file (or line range within it)
 { name: "memory_get", params: { path: string, from?: number, lines?: number } }
 ```
 
-Delegates to the memory manager (Section 8).
+See Section 8 for details. Uses lazy-sync embedding index over workspace markdown files.
 
 #### Web Tools (`src/tools/web.ts`)
 
@@ -1081,403 +1016,283 @@ When this heartbeat runs, check the following:
 
 ## 8. Memory
 
-### 8.1 Architecture
+### 8.1 Design Philosophy
 
-The memory system provides persistent, searchable knowledge that survives session resets and context compaction.
+OpenClaw's memory system is a full embedded search engine: SQLite, FTS5 virtual tables, vector embeddings, hybrid BM25+cosine scoring, embedding caches, file watchers with chokidar, and atomic database swaps for reindexing. That's appropriate for a multi-agent system indexing thousands of files across multiple workspaces.
+
+For a single personal WhatsApp bot, we simplify radically. The agent already has a `read` tool and a `write` tool. Memory is just **markdown files the agent reads and writes**. The only addition is a `memory_search` tool that does vector search over those files so the agent can find things without reading every file.
+
+### 8.2 What's on Disk
 
 ```
-Workspace files (source of truth)
-├── MEMORY.md               # Curated long-term facts
+workspace/
+├── MEMORY.md              # Curated long-term facts (agent maintains this)
 └── memory/
-    ├── 2026-02-15.md        # Daily log
+    ├── 2026-02-15.md      # Daily log
     ├── 2026-02-16.md
-    └── 2026-02-17.md
-         │
-         ▼
-    ┌─────────────┐
-    │  Chunker     │  Split markdown into ~400-token chunks
-    └──────┬──────┘
-           ▼
-    ┌─────────────┐
-    │ Embeddings   │  OpenAI text-embedding-3-small (or local)
-    └──────┬──────┘
-           ▼
-    ┌─────────────┐
-    │   SQLite     │  Store chunks + embeddings + FTS5 index
-    │   Database   │
-    └──────┬──────┘
-           │
-    ┌──────┴──────┐
-    │ Hybrid       │  Vector cosine similarity (70%) +
-    │ Search       │  BM25 keyword match (30%)
-    └─────────────┘
+    ├── 2026-02-17.md
+    └── .index.sqlite      # Embedding index (auto-generated, gitignored)
 ```
 
-### 8.2 Database Schema
+**MEMORY.md** is the primary knowledge base. The agent is instructed (via AGENTS.md) to keep it organized: user preferences, key decisions, recurring topics, important facts.
+
+**memory/YYYY-MM-DD.md** files are daily append-only logs. The agent writes here during conversation when it learns something worth remembering, and during pre-compaction flushes.
+
+**.index.sqlite** is a derived artifact. Delete it and it rebuilds from the .md files on next search.
+
+### 8.3 How It Works
+
+```
+Agent calls memory_search("user's birthday")
+  │
+  ├─ 1. Scan memory dir for .md files
+  │     Compare file mtimes against last indexed mtimes
+  │     Re-chunk + re-embed only changed files
+  │
+  ├─ 2. Embed the query via OpenAI
+  │     text-embedding-3-small → 1536-dim vector
+  │
+  ├─ 3. Cosine similarity against all stored chunks
+  │     Sort by score, return top 5
+  │
+  └─ Returns: [{ file, lines, score, snippet }]
+```
+
+No hybrid search, no BM25, no FTS5. Just vector similarity. For a personal memory corpus (likely <100 files, <1000 chunks), brute-force cosine over all chunks is fast enough — OpenClaw itself falls back to this when the sqlite-vec extension isn't available.
+
+### 8.4 SQLite Schema
+
+Minimal. Two tables.
 
 ```sql
--- Metadata table
-CREATE TABLE meta (
-  key TEXT PRIMARY KEY,
-  value TEXT
-);
-
--- Tracked files
 CREATE TABLE files (
   path TEXT PRIMARY KEY,
-  hash TEXT NOT NULL,
-  mtime INTEGER NOT NULL,
-  size INTEGER NOT NULL
+  hash TEXT NOT NULL,           -- SHA-256 of file content
+  mtime INTEGER NOT NULL
 );
 
--- Memory chunks with embeddings
 CREATE TABLE chunks (
-  id TEXT PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   path TEXT NOT NULL,
   start_line INTEGER NOT NULL,
   end_line INTEGER NOT NULL,
-  hash TEXT NOT NULL,
-  model TEXT NOT NULL,
   text TEXT NOT NULL,
-  embedding TEXT NOT NULL,       -- JSON array of floats
-  updated_at INTEGER NOT NULL,
-  FOREIGN KEY (path) REFERENCES files(path)
-);
-
--- BM25 full-text search
-CREATE VIRTUAL TABLE chunks_fts USING fts5(
-  text,
-  content=chunks,
-  content_rowid=rowid
-);
-
--- Embedding cache (avoid re-embedding unchanged text)
-CREATE TABLE embedding_cache (
-  hash TEXT PRIMARY KEY,
-  model TEXT NOT NULL,
-  embedding TEXT NOT NULL,
-  dims INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  embedding BLOB NOT NULL,     -- Float32Array as raw bytes (not JSON)
+  FOREIGN KEY (path) REFERENCES files(path) ON DELETE CASCADE
 );
 ```
 
-### 8.3 Chunking (`src/memory/chunker.ts`)
+That's it. No FTS5, no embedding cache table, no metadata table. When a file changes (hash differs), delete its old chunks and reinsert. When a file is deleted, `ON DELETE CASCADE` cleans up.
 
-Split markdown files into overlapping chunks of ~400 tokens:
+Embeddings are stored as raw `Float32Array` buffers (6KB per chunk at 1536 dims) instead of JSON strings (~12KB per chunk). For a personal corpus this doesn't matter much, but it's simpler to work with in code.
+
+### 8.5 Chunking
+
+Same approach as OpenClaw but hardcoded instead of configurable:
 
 ```typescript
-type MemoryChunk = {
-  path: string;
-  startLine: number;       // 1-indexed
-  endLine: number;
-  text: string;
-  hash: string;            // SHA-256 of text
-};
+const CHUNK_CHARS = 1600;     // ~400 tokens
+const OVERLAP_CHARS = 320;    // ~80 tokens
 
-function chunkMarkdown(
-  path: string,
-  content: string,
-  opts: { tokens: number; overlap: number },
-): MemoryChunk[] {
+function chunkFile(path: string, content: string): Chunk[] {
   const lines = content.split("\n");
-  const chunks: MemoryChunk[] = [];
+  const chunks: Chunk[] = [];
   let start = 0;
+  let charCount = 0;
 
-  while (start < lines.length) {
-    // Accumulate lines until we hit target token count
-    let end = start;
-    let tokenCount = 0;
-    while (end < lines.length && tokenCount < opts.tokens) {
-      tokenCount += estimateTokens(lines[end]);
-      end++;
+  for (let i = 0; i < lines.length; i++) {
+    charCount += lines[i].length + 1;
+    if (charCount >= CHUNK_CHARS || i === lines.length - 1) {
+      chunks.push({
+        path,
+        startLine: start + 1,
+        endLine: i + 1,
+        text: lines.slice(start, i + 1).join("\n"),
+      });
+      // Walk back for overlap
+      let overlapChars = 0;
+      let overlapStart = i;
+      while (overlapStart > start && overlapChars < OVERLAP_CHARS) {
+        overlapChars += lines[overlapStart].length + 1;
+        overlapStart--;
+      }
+      start = overlapStart + 1;
+      charCount = 0;
     }
-
-    chunks.push({
-      path,
-      startLine: start + 1,
-      endLine: end,
-      text: lines.slice(start, end).join("\n"),
-      hash: sha256(lines.slice(start, end).join("\n")),
-    });
-
-    // Advance with overlap
-    const overlapLines = findOverlapStart(lines, end, opts.overlap);
-    start = Math.max(start + 1, end - overlapLines);
   }
-
   return chunks;
 }
 ```
 
-### 8.4 Embedding Provider (`src/memory/embeddings.ts`)
+### 8.6 Memory Tools
+
+Two tools exposed to the agent:
 
 ```typescript
-interface EmbeddingProvider {
-  embed(texts: string[]): Promise<number[][]>;
-  dimensions: number;
-  model: string;
-}
-
-function createEmbeddingProvider(config: CasperConfig["memory"]["embedding"]): EmbeddingProvider {
-  switch (config.provider) {
-    case "openai":
-      return createOpenAIEmbeddings(config);
-    case "local":
-      return createLocalEmbeddings(config);
-    default:
-      throw new Error(`Unknown embedding provider: ${config.provider}`);
-  }
-}
-
-// OpenAI implementation
-function createOpenAIEmbeddings(config): EmbeddingProvider {
-  const client = new OpenAI({ apiKey: config.apiKey ?? process.env.OPENAI_API_KEY });
-  const model = config.model ?? "text-embedding-3-small";
-
-  return {
-    model,
-    dimensions: 1536,
-    embed: async (texts) => {
-      const response = await client.embeddings.create({
-        model,
-        input: texts,
-      });
-      return response.data.map((d) => d.embedding);
+// memory_search: Find relevant memories
+{
+  name: "memory_search",
+  description: "Search long-term memory for relevant information.",
+  parameters: {
+    type: "object",
+    properties: {
+      query: { type: "string", description: "What to search for" },
     },
-  };
+    required: ["query"],
+  },
+  execute: async (id, { query }) => {
+    await indexer.syncIfNeeded();                    // Re-index changed files
+    const queryVec = await embed(query);             // Embed query
+    const results = indexer.search(queryVec, 5);     // Top 5 by cosine sim
+    return { content: [{ type: "text", text: formatResults(results) }] };
+  },
+}
+
+// memory_get: Read a specific memory file (or range of lines)
+{
+  name: "memory_get",
+  description: "Read a memory file. Use after memory_search to see full context.",
+  parameters: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "Relative path within memory dir" },
+      from: { type: "number", description: "Start line (1-indexed)" },
+      lines: { type: "number", description: "Number of lines to read" },
+    },
+    required: ["path"],
+  },
+  execute: async (id, { path: filePath, from, lines }) => {
+    const content = readMemoryFile(filePath, from, lines);
+    return { content: [{ type: "text", text: content }] };
+  },
 }
 ```
 
-### 8.5 Hybrid Search (`src/memory/search.ts`)
+### 8.7 Sync Strategy
 
-```typescript
-type SearchResult = {
-  path: string;
-  startLine: number;
-  endLine: number;
-  score: number;           // 0-1 blended score
-  snippet: string;         // Truncated to ~700 chars
-};
+**Lazy sync on search** — no file watchers, no chokidar dependency. When `memory_search` is called:
 
-async function hybridSearch(
-  db: Database,
-  embedder: EmbeddingProvider,
-  query: string,
-  opts: CasperConfig["memory"]["search"],
-): Promise<SearchResult[]> {
-  const maxResults = opts.maxResults;
-  const candidateCount = maxResults * (opts.hybrid.candidateMultiplier ?? 4);
+1. List all `.md` files in the memory dir
+2. For each file, compare `fs.statSync(file).mtimeMs` against stored mtime
+3. If changed: re-read, re-chunk, re-embed, update in SQLite
+4. If new file: chunk, embed, insert
+5. If file deleted: delete from SQLite (cascade removes chunks)
 
-  // 1. Vector search
-  const queryEmbedding = (await embedder.embed([query]))[0];
-  const vectorResults = vectorSearch(db, queryEmbedding, candidateCount);
+This is fast because the corpus is small and embedding calls are batched. OpenAI's embedding API accepts arrays of texts, so we send all new/changed chunks in one call.
 
-  // 2. BM25 keyword search
-  const textResults = bm25Search(db, query, candidateCount);
-
-  // 3. Merge and score
-  const merged = new Map<string, { vectorScore: number; textScore: number }>();
-
-  for (const r of vectorResults) {
-    merged.set(r.id, { vectorScore: r.score, textScore: 0 });
-  }
-  for (const r of textResults) {
-    const existing = merged.get(r.id) ?? { vectorScore: 0, textScore: 0 };
-    existing.textScore = r.score;
-    merged.set(r.id, existing);
-  }
-
-  // 4. Weighted blend
-  const scored = Array.from(merged.entries()).map(([id, scores]) => ({
-    id,
-    score: opts.hybrid.vectorWeight * scores.vectorScore +
-           opts.hybrid.textWeight * scores.textScore,
-  }));
-
-  // 5. Filter and sort
-  return scored
-    .filter((r) => r.score >= opts.minScore)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, maxResults)
-    .map((r) => lookupChunk(db, r.id, r.score));
-}
-
-function vectorSearch(db: Database, embedding: number[], limit: number) {
-  // Cosine similarity against all stored embeddings
-  const chunks = db.prepare("SELECT id, embedding FROM chunks").all();
-  return chunks
-    .map((chunk) => ({
-      id: chunk.id,
-      score: cosineSimilarity(embedding, JSON.parse(chunk.embedding)),
-    }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
-}
-
-function bm25Search(db: Database, query: string, limit: number) {
-  // SQLite FTS5 BM25 ranking
-  const rows = db.prepare(`
-    SELECT rowid, rank FROM chunks_fts
-    WHERE chunks_fts MATCH ?
-    ORDER BY rank
-    LIMIT ?
-  `).all(query, limit);
-
-  // Normalize BM25 scores to 0-1 range
-  const maxRank = Math.abs(rows[0]?.rank ?? 1);
-  return rows.map((r) => ({
-    id: lookupIdByRowid(db, r.rowid),
-    score: Math.abs(r.rank) / maxRank,
-  }));
-}
-```
-
-### 8.6 File Sync (`src/memory/sync.ts`)
-
-Watches memory files for changes and incrementally reindexes.
-
-```typescript
-class MemorySync {
-  private watcher: FSWatcher | null = null;
-  private dirty = false;
-  private debounceTimer: NodeJS.Timeout | null = null;
-
-  start(workspaceDir: string, config: CasperConfig["memory"]): void {
-    if (!config.sync.watch) return;
-
-    const watchPaths = [
-      path.join(workspaceDir, "MEMORY.md"),
-      path.join(workspaceDir, "memory"),
-    ];
-
-    this.watcher = chokidar.watch(watchPaths, {
-      ignoreInitial: true,
-      awaitWriteFinish: {
-        stabilityThreshold: config.sync.watchDebounceMs,
-      },
-    });
-
-    this.watcher.on("change", () => this.markDirty());
-    this.watcher.on("add", () => this.markDirty());
-    this.watcher.on("unlink", () => this.markDirty());
-  }
-
-  private markDirty(): void {
-    this.dirty = true;
-  }
-
-  async syncIfDirty(manager: MemoryManager): Promise<void> {
-    if (!this.dirty) return;
-    this.dirty = false;
-    await manager.reindex();
-  }
-}
-```
-
-### 8.7 Memory Lifecycle
+### 8.8 Memory Lifecycle
 
 ```
 1. Startup:
-   - Open/create SQLite database
-   - Initial sync: scan MEMORY.md + memory/*.md
-   - Chunk files → generate embeddings → store in SQLite
-   - Start file watcher
+   - Nothing. Index is built lazily on first memory_search.
 
-2. Agent writes memory:
-   - Agent calls write tool → memory/2026-02-17.md
-   - File watcher detects change → marks dirty
-   - Next memory_search call → syncIfDirty() → reindex changed file
+2. During conversation:
+   - Agent learns something → writes to memory/YYYY-MM-DD.md via write tool
+   - Agent needs to recall → calls memory_search → lazy sync → vector search
 
-3. Agent searches memory:
-   - Agent calls memory_search("user's birthday")
-   - Sync if dirty
-   - Generate query embedding
-   - Dual search: vector + BM25
-   - Merge results → return top N snippets
-
-4. Pre-compaction flush:
+3. Pre-compaction flush:
    - Session approaching context limit
-   - Silent agent turn: "Store important memories"
+   - Gateway injects a silent prompt: "Store important memories from this conversation"
    - Agent writes to memory/YYYY-MM-DD.md
-   - Session compacted (old turns summarized)
-   - Memories preserved in files → searchable later
+   - pi-coding-agent compacts the session (summarizes old turns)
+   - Memories survive in files, searchable via memory_search later
+
+4. Index corruption / stale:
+   - Delete .index.sqlite → rebuilds on next search
 ```
 
 ---
 
 ## 9. Session Management
 
-### 9.1 Session Storage
+### 9.1 Design Philosophy
 
-Sessions are stored as JSONL files (one JSON object per line):
+OpenClaw's session system handles multi-agent, multi-channel, multi-account routing with complex key generation (`agent:<id>:<channel>:<kind>:<peerId>:thread:<threadId>`), write locking with 10s timeouts, atomic file renames, 45s in-memory caches, session branching, topic splitting, and maintenance policies (prune after 30 days, cap 500 entries, rotate at 10MB).
+
+Casper Claw has one agent, one channel. We delegate to `pi-coding-agent`'s `SessionManager` which already handles JSONL persistence. We just need to tell it which file to use.
+
+### 9.2 Session Storage
+
+pi-coding-agent's `SessionManager` stores sessions as JSONL files. We just pick the file path:
 
 ```
 sessions/
-├── casper_wa_1234567890.jsonl     # Per-sender session
-├── casper_wa_9876543210.jsonl
-└── casper_main.jsonl              # Global/heartbeat session
+├── 1234567890.jsonl         # Per-sender (JID without @s.whatsapp.net)
+├── 9876543210.jsonl
+└── _main.jsonl              # Heartbeat / system session
 ```
 
-Each file contains:
+Each file is managed entirely by `SessionManager.open(filePath)`. It handles:
+- Appending messages (user, assistant, tool_use, tool_result)
+- Building the message array for LLM calls
+- Compaction (summarizing old turns when context gets full)
+- Reading back the session on process restart
 
-```jsonl
-{"type":"session","id":"casper:wa:1234567890","cwd":"./workspace"}
-{"type":"message","message":{"role":"user","content":"Hello"}}
-{"type":"message","message":{"role":"assistant","content":"Hi! How can I help?"}}
-{"type":"message","message":{"role":"user","content":"What's the weather?"}}
-{"type":"message","message":{"role":"assistant","content":"Let me check...","tool_calls":[...]}}
-{"type":"tool_result","tool_call_id":"...","content":"72°F, sunny"}
-{"type":"message","message":{"role":"assistant","content":"It's 72°F and sunny today."}}
-```
+We don't wrap, cache, or lock these files — `SessionManager` does it.
 
-### 9.2 Session Reset
-
-Sessions reset based on config:
+### 9.3 Session Key → File Path
 
 ```typescript
-function shouldResetSession(
-  sessionKey: string,
-  lastMessageAt: number,
-  config: CasperConfig["session"],
-): boolean {
+function sessionFilePath(jid: string, config: CasperConfig): string {
+  if (config.session.scope === "global") {
+    return path.join(config.session.dir, "_main.jsonl");
+  }
+  const senderId = jid.split("@")[0];   // "1234567890"
+  return path.join(config.session.dir, `${senderId}.jsonl`);
+}
+```
+
+### 9.4 Session Reset
+
+Two reset modes, checked before each agent run:
+
+```typescript
+function shouldReset(sessionFile: string, config: CasperConfig["session"]): boolean {
   if (!config.reset) return false;
 
-  if (config.reset.mode === "daily") {
-    const lastDate = new Date(lastMessageAt);
-    const now = new Date();
-    const resetHour = config.reset.atHour ?? 0;
-    // Reset if we've crossed the reset hour boundary
-    return crossedResetBoundary(lastDate, now, resetHour);
-  }
+  const stat = fs.statSync(sessionFile, { throwIfNoEntry: false });
+  if (!stat) return false;  // No session file yet
+
+  const lastModified = stat.mtimeMs;
+  const now = Date.now();
 
   if (config.reset.mode === "idle") {
-    const idleMs = (config.reset.idleMinutes ?? 60) * 60 * 1000;
-    return Date.now() - lastMessageAt > idleMs;
+    const idleMs = (config.reset.idleMinutes ?? 60) * 60_000;
+    return now - lastModified > idleMs;
+  }
+
+  if (config.reset.mode === "daily") {
+    const resetHour = config.reset.atHour ?? 4;
+    const lastDate = new Date(lastModified);
+    const today = new Date();
+    today.setHours(resetHour, 0, 0, 0);
+    // Reset if the session file was last written before today's reset hour
+    return lastDate < today && new Date() >= today;
   }
 
   return false;
 }
-```
 
-### 9.3 History Limiting
-
-Before feeding history to the LLM, limit to `maxHistoryTurns`:
-
-```typescript
-function limitHistory(messages: Message[], maxTurns: number): Message[] {
-  // Keep the most recent N user-assistant turn pairs
-  const turns: [Message, Message][] = [];
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user") {
-      const assistant = messages[i + 1]; // Next message should be assistant
-      if (assistant?.role === "assistant") {
-        turns.unshift([messages[i], assistant]);
-      }
-    }
-  }
-  return turns.slice(-maxTurns).flat();
+// Reset = rename old file, start fresh
+function resetSession(sessionFile: string): void {
+  const backup = sessionFile.replace(".jsonl", `.${Date.now()}.jsonl`);
+  fs.renameSync(sessionFile, backup);
 }
 ```
+
+Also supports `/new` and `/reset` as text triggers — if the incoming message matches, reset the session before running the agent.
+
+### 9.5 Compaction
+
+Handled entirely by `pi-coding-agent`. When the context window fills up:
+
+1. **Pre-compaction memory flush**: Before compacting, the gateway runs a silent agent turn with the prompt "Store important memories from this conversation to memory files." The agent writes to `memory/YYYY-MM-DD.md`. This ensures long-term knowledge is preserved before old turns are summarized away.
+
+2. **Compaction**: `SessionManager.compact()` summarizes old conversation turns into a shorter summary, freeing context space. The session continues with the summary + recent turns.
+
+3. **If still too long**: The gateway resets the session and tells the user the conversation was too long.
+
+We don't implement our own compaction logic. We call `session.compact()` and let the library handle it.
 
 ---
 
@@ -1549,14 +1364,11 @@ The LLM sees the error and can decide how to proceed (retry, try alternative, in
 
 ### Phase 2: Memory + Heartbeat (Week 2)
 
-9. **Memory SQLite** — Schema creation, chunk storage
-10. **Chunker** — Markdown → overlapping chunks
-11. **Embeddings** — OpenAI embedding integration
-12. **Hybrid search** — Vector + BM25 search
-13. **Memory tools** — memory_search, memory_get for the agent
-14. **File watcher** — Incremental reindex on file changes
-15. **Heartbeat runner** — Interval timer, HEARTBEAT.md, HEARTBEAT_OK suppression
-16. **Active hours** — Quiet hours for heartbeat
+9. **Memory indexer** — SQLite schema, chunking, OpenAI embeddings, cosine search (single file)
+10. **Memory tools** — memory_search, memory_get tool definitions
+11. **Heartbeat runner** — Interval timer, HEARTBEAT.md, HEARTBEAT_OK suppression
+12. **Active hours** — Quiet hours for heartbeat
+13. **Pre-compaction flush** — Memory flush hook before session compaction
 
 **Milestone**: Agent remembers things across sessions. Heartbeat checks in periodically.
 
