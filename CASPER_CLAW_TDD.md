@@ -18,9 +18,9 @@ Casper Claw is a personal AI assistant that runs as a WhatsApp bot, built on the
 |---|---|
 | Gateway (message routing + lifecycle) | Simplified gateway (Baileys connection + message dispatch) |
 | Heartbeat (periodic background agent turns) | Heartbeat runner (interval timer + HEARTBEAT.md) |
-| Memory (vector search + markdown files) | Markdown files + lazy embedding index |
+| Memory (vector search + markdown files) | A single `MEMORY.md` file the agent reads/writes |
 | Pi runtime (agent loop + tools + streaming) | Same — `pi-coding-agent` + `pi-ai` |
-| Session persistence (JSONL transcripts) | Delegate to `SessionManager` from `pi-coding-agent` |
+| Session persistence (JSONL transcripts) | `SessionManager` from `pi-coding-agent` — one JSONL file per sender |
 | System prompt (identity + context injection) | Simplified system prompt builder |
 | Tools (structured LLM tool calls) | TypeScript SDK tools (not CLI wrappers) |
 
@@ -73,9 +73,6 @@ casper-claw (main process)
 ├── @mariozechner/pi-coding-agent    # Agent session, SessionManager
 ├── @mariozechner/pi-ai              # LLM streaming (streamSimple)
 ├── @mariozechner/pi-agent-core      # Agent types, events
-├── better-sqlite3                   # Memory embedding index
-├── openai                           # Embeddings SDK
-│
 ├── SDK integrations (per config):
 │   ├── octokit                      # GitHub
 │   ├── @notionhq/client             # Notion
@@ -102,8 +99,7 @@ casper-claw/
 │   ├── gateway/
 │   │   ├── gateway.ts               # Main gateway lifecycle
 │   │   ├── whatsapp.ts              # Baileys connection manager
-│   │   ├── message-handler.ts       # Inbound message dispatch
-│   │   └── session-key.ts           # Session key generation
+│   │   └── message-handler.ts       # Inbound message dispatch
 │   ├── agent/
 │   │   ├── runner.ts                # Wraps runEmbeddedPiAgent()
 │   │   ├── system-prompt.ts         # System prompt builder
@@ -113,9 +109,6 @@ casper-claw/
 │   │   ├── runner.ts                # Interval timer + execution
 │   │   ├── visibility.ts            # Suppress/deliver logic
 │   │   └── active-hours.ts          # Quiet hours check
-│   ├── memory/
-│   │   ├── indexer.ts               # Chunk, embed, store, search (single file)
-│   │   └── tools.ts                 # memory_search, memory_get tool defs
 │   ├── tools/
 │   │   ├── exec.ts                  # Shell execution tool
 │   │   ├── fs.ts                    # Read, write, edit tools
@@ -123,16 +116,12 @@ casper-claw/
 │   │   ├── github.ts                # GitHub tool (octokit)
 │   │   ├── notion.ts                # Notion tool
 │   │   └── index.ts                 # Tool registry + assembly
-│   └── sessions/
-│       └── sessions.ts              # Session file path resolution + reset logic
 ├── casper.json                      # Configuration file
 ├── workspace/
 │   ├── AGENTS.md                    # Agent operating instructions
 │   ├── SOUL.md                      # Personality + tone
 │   ├── HEARTBEAT.md                 # Periodic check instructions
-│   ├── MEMORY.md                    # Curated long-term memory
-│   └── memory/
-│       └── YYYY-MM-DD.md            # Daily memory logs
+│   └── MEMORY.md                    # Long-term memory (agent reads/writes this)
 ├── package.json
 ├── tsconfig.json
 └── README.md
@@ -174,14 +163,7 @@ type CasperConfig = {
 
   // Session management
   session: {
-    dir: string;                         // "./sessions"
-    scope: "per-sender" | "global";      // One session per sender or shared
-    reset?: {
-      mode: "daily" | "idle";
-      atHour?: number;                   // 0-23 for daily reset
-      idleMinutes?: number;              // Minutes before idle reset
-    };
-    maxHistoryTurns?: number;            // Limit conversation turns (default: 50)
+    dir: string;                         // "./sessions" — where JSONL files live
   };
 
   // Heartbeat
@@ -196,13 +178,6 @@ type CasperConfig = {
     };
     prompt?: string;                     // Custom heartbeat prompt
     ackMaxChars?: number;                // 300 — suppress short acks
-  };
-
-  // Memory
-  memory: {
-    enabled: boolean;                    // true
-    dir: string;                         // "./workspace/memory" — where .md files live
-    embeddingModel?: string;             // "text-embedding-3-small" (uses OPENAI_API_KEY from env)
   };
 
   // Tools — which SDK integrations to enable
@@ -233,7 +208,6 @@ type CasperConfig = {
   // Auth
   auth: {
     anthropicApiKey?: string;            // Or env ANTHROPIC_API_KEY
-    openaiApiKey?: string;               // For embeddings; or env OPENAI_API_KEY
   };
 
   // Logging
@@ -261,10 +235,7 @@ type CasperConfig = {
     "mentionPatterns": ["@casper"]
   },
   "session": {
-    "dir": "./sessions",
-    "scope": "per-sender",
-    "reset": { "mode": "daily", "atHour": 4 },
-    "maxHistoryTurns": 50
+    "dir": "./sessions"
   },
   "heartbeat": {
     "enabled": true,
@@ -275,10 +246,6 @@ type CasperConfig = {
       "end": "22:00",
       "timezone": "America/New_York"
     }
-  },
-  "memory": {
-    "enabled": true,
-    "dir": "./workspace/memory"
   },
   "tools": {
     "profile": "coding",
@@ -311,23 +278,18 @@ startGateway(config)
 │     ├─ Load auth state from config.whatsapp.authDir
 │     ├─ Connect to WhatsApp (QR code on first run)
 │     └─ Register message listener
-├─ 3. Initialize memory system
-│     ├─ Open SQLite database
-│     ├─ Run initial sync (index workspace/MEMORY.md + memory/*.md)
-│     └─ Start file watcher
-├─ 4. Initialize agent
+├─ 3. Initialize agent
 │     ├─ Resolve model + auth
 │     ├─ Build system prompt
 │     └─ Assemble tools
-├─ 5. Start heartbeat runner
+├─ 4. Start heartbeat runner
 │     ├─ Calculate next due time
 │     └─ Schedule timer
-├─ 6. RUNNING — process messages
+├─ 5. RUNNING — process messages
 │
 └─ On SIGINT/SIGTERM:
     ├─ Stop heartbeat timer
     ├─ Close Baileys connection
-    ├─ Close SQLite database
     └─ Exit
 ```
 
@@ -434,8 +396,9 @@ async function handleInboundMessage(
     }
   }
 
-  // 4. Resolve session key
-  const sessionKey = buildSessionKey(msg.jid, ctx.config);
+  // 4. Resolve session file
+  const senderId = msg.jid.split("@")[0];
+  const sessionFile = path.join(ctx.config.session.dir, `${senderId}.jsonl`);
 
   // 5. Send ack reaction (eyes emoji)
   await ctx.wa.sendReaction(msg.jid, msg.messageId, "👀");
@@ -443,7 +406,7 @@ async function handleInboundMessage(
   // 6. Dispatch to agent
   const result = await ctx.agent.run({
     prompt: msg.text,
-    sessionKey,
+    sessionFile,
     senderName: msg.senderName,
     senderJid: msg.jid,
     media: msg.mediaBuffer ? { type: msg.mediaType!, data: msg.mediaBuffer } : undefined,
@@ -462,52 +425,33 @@ async function handleInboundMessage(
 }
 ```
 
-### 4.4 Session Key Generation (`src/gateway/session-key.ts`)
+### 4.4 Concurrency Control
+
+Only one agent run per sender at a time. If a message arrives while the agent is already processing for that sender, queue it.
 
 ```typescript
-function buildSessionKey(jid: string, config: CasperConfig): string {
-  if (config.session.scope === "global") {
-    return "casper:main";
-  }
-  // per-sender: one session per WhatsApp JID
-  const normalized = jid.split("@")[0]; // strip @s.whatsapp.net
-  return `casper:wa:${normalized}`;
-}
-```
+const active = new Set<string>();
+const queue = new Map<string, InboundMessage[]>();
 
-### 4.5 Concurrency Control
+async function dispatch(msg: InboundMessage): Promise<void> {
+  const sender = msg.jid;
 
-Only one agent run per session key at a time. If a message arrives while the agent is already running for that session, queue it.
-
-```typescript
-type MessageQueue = Map<string, Array<InboundMessage>>;
-type ActiveRuns = Set<string>;
-
-// In gateway.ts:
-const queue: MessageQueue = new Map();
-const active: ActiveRuns = new Set();
-
-async function dispatch(msg: InboundMessage, sessionKey: string): Promise<void> {
-  if (active.has(sessionKey)) {
-    // Queue the message — process after current run completes
-    const pending = queue.get(sessionKey) ?? [];
+  if (active.has(sender)) {
+    const pending = queue.get(sender) ?? [];
     pending.push(msg);
-    queue.set(sessionKey, pending);
+    queue.set(sender, pending);
     return;
   }
 
-  active.add(sessionKey);
+  active.add(sender);
   try {
     await handleInboundMessage(msg, ctx);
-
-    // Process queued messages for this session
-    while (queue.get(sessionKey)?.length) {
-      const next = queue.get(sessionKey)!.shift()!;
-      await handleInboundMessage(next, ctx);
+    while (queue.get(sender)?.length) {
+      await handleInboundMessage(queue.get(sender)!.shift()!, ctx);
     }
   } finally {
-    active.delete(sessionKey);
-    queue.delete(sessionKey);
+    active.delete(sender);
+    queue.delete(sender);
   }
 }
 ```
@@ -526,7 +470,7 @@ import { streamSimple } from "@mariozechner/pi-ai";
 
 type AgentRunParams = {
   prompt: string;
-  sessionKey: string;
+  sessionFile: string;
   senderName: string;
   senderJid: string;
   media?: { type: string; data: Buffer };
@@ -558,7 +502,7 @@ class AgentRunner {
       cwd: this.config.agent.workspace,
       model: this.config.agent.model,
       customTools: this.tools,
-      sessionManager: getSessionManager(params.sessionKey, this.config),
+      sessionManager: SessionManager.open(params.sessionFile),
     });
 
     // 2. Set system prompt
@@ -613,20 +557,16 @@ function buildSystemPrompt(config: CasperConfig): string {
     `You have tools available. Use them when needed to help the user.`,
     `- File tools (read, write, edit): Access files in the workspace`,
     `- Exec tool: Run shell commands`,
-    `- Memory tools (memory_search, memory_get): Search and retrieve long-term memories`,
     // ... dynamically list enabled integrations
   );
 
   // 3. Memory
-  if (config.memory.enabled) {
-    sections.push(
-      `## Memory`,
-      `You have long-term memory. Use memory_search to recall past information.`,
-      `Write important facts, preferences, and decisions to memory/ files.`,
-      `- MEMORY.md: Curated long-term facts`,
-      `- memory/YYYY-MM-DD.md: Daily logs (append-only)`,
-    );
-  }
+  sections.push(
+    `## Memory`,
+    `MEMORY.md is your long-term memory. Read it at the start of conversations`,
+    `to recall context. Write to it when you learn important facts, preferences,`,
+    `or decisions that should persist across sessions.`,
+  );
 
   // 4. Workspace files (inject AGENTS.md, SOUL.md, etc.)
   const workspaceFiles = ["AGENTS.md", "SOUL.md", "USER.md"];
@@ -652,7 +592,7 @@ function buildSystemPrompt(config: CasperConfig): string {
 
 ### 5.3 Context Management
 
-Delegated to `pi-coding-agent`'s built-in compaction. The gateway adds a pre-compaction memory flush hook (see Section 9.5) so memories are preserved before old turns are summarized. If compaction fails, the session is reset.
+Delegated to `pi-coding-agent`'s built-in compaction. If compaction fails, the session is reset.
 
 ---
 
@@ -681,8 +621,8 @@ type AnyAgentTool = {
 Three profiles control which tools are available:
 
 ```
-minimal:    memory_search, memory_get
-coding:     minimal + read, write, edit, exec, web_search, web_fetch
+minimal:    read, write, edit
+coding:     minimal + exec, web_search, web_fetch
 full:       coding + all enabled integrations
 ```
 
@@ -711,18 +651,6 @@ These wrap Node.js `fs` operations. Paths are resolved relative to the workspace
 ```
 
 Spawns a child process with configurable timeout. Captures stdout + stderr. Working directory is the workspace.
-
-#### Memory Tools (`src/memory/tools.ts`)
-
-```typescript
-// memory_search: Vector search over memory markdown files
-{ name: "memory_search", params: { query: string } }
-
-// memory_get: Read a specific memory file (or line range within it)
-{ name: "memory_get", params: { path: string, from?: number, lines?: number } }
-```
-
-See Section 8 for details. Uses lazy-sync embedding index over workspace markdown files.
 
 #### Web Tools (`src/tools/web.ts`)
 
@@ -925,14 +853,12 @@ class HeartbeatRunner {
     const prompt = this.config.heartbeat.prompt
       ?? "Read HEARTBEAT.md and follow it. If nothing needs attention, reply HEARTBEAT_OK.";
 
-    // 5. Run agent in the owner's session
-    const sessionKey = this.config.heartbeat.target === "owner"
-      ? buildSessionKey(this.config.whatsapp.ownerJid!, this.config)
-      : "casper:main";
+    // 5. Run agent in the heartbeat session
+    const sessionFile = path.join(this.config.session.dir, "_heartbeat.jsonl");
 
     const result = await this.agent.run({
       prompt,
-      sessionKey,
+      sessionFile,
       senderName: "system",
       senderJid: "heartbeat",
     });
@@ -1016,283 +942,100 @@ When this heartbeat runs, check the following:
 
 ## 8. Memory
 
-### 8.1 Design Philosophy
+Memory is a single markdown file: `workspace/MEMORY.md`.
 
-OpenClaw's memory system is a full embedded search engine: SQLite, FTS5 virtual tables, vector embeddings, hybrid BM25+cosine scoring, embedding caches, file watchers with chokidar, and atomic database swaps for reindexing. That's appropriate for a multi-agent system indexing thousands of files across multiple workspaces.
+The agent reads it (via the `read` tool) and writes to it (via the `write` or `edit` tool). There is no database, no embeddings, no indexing, no search tool. The file is small enough to fit in context — the agent just reads the whole thing when it needs to remember something.
 
-For a single personal WhatsApp bot, we simplify radically. The agent already has a `read` tool and a `write` tool. Memory is just **markdown files the agent reads and writes**. The only addition is a `memory_search` tool that does vector search over those files so the agent can find things without reading every file.
-
-### 8.2 What's on Disk
+### 8.1 How It Works
 
 ```
-workspace/
-├── MEMORY.md              # Curated long-term facts (agent maintains this)
-└── memory/
-    ├── 2026-02-15.md      # Daily log
-    ├── 2026-02-16.md
-    ├── 2026-02-17.md
-    └── .index.sqlite      # Embedding index (auto-generated, gitignored)
+workspace/MEMORY.md
 ```
 
-**MEMORY.md** is the primary knowledge base. The agent is instructed (via AGENTS.md) to keep it organized: user preferences, key decisions, recurring topics, important facts.
+That's it. One file. The system prompt tells the agent:
 
-**memory/YYYY-MM-DD.md** files are daily append-only logs. The agent writes here during conversation when it learns something worth remembering, and during pre-compaction flushes.
+> MEMORY.md is your long-term memory. Read it at the start of important conversations
+> to recall context. Write to it when you learn important facts, preferences,
+> or decisions that should persist across sessions.
 
-**.index.sqlite** is a derived artifact. Delete it and it rebuilds from the .md files on next search.
+The agent uses the `read` and `edit` tools it already has. No new tools, no new infrastructure.
 
-### 8.3 How It Works
+### 8.2 Why This Is Enough
 
-```
-Agent calls memory_search("user's birthday")
-  │
-  ├─ 1. Scan memory dir for .md files
-  │     Compare file mtimes against last indexed mtimes
-  │     Re-chunk + re-embed only changed files
-  │
-  ├─ 2. Embed the query via OpenAI
-  │     text-embedding-3-small → 1536-dim vector
-  │
-  ├─ 3. Cosine similarity against all stored chunks
-  │     Sort by score, return top 5
-  │
-  └─ Returns: [{ file, lines, score, snippet }]
-```
+A personal WhatsApp bot's memory needs are small: the user's name, preferences, a few key decisions, ongoing projects. That's a few KB of markdown — easily fits in a single context window read. If it grows too large, the agent can reorganize it (move old items to an archive section, summarize, etc.) using the same `edit` tool.
 
-No hybrid search, no BM25, no FTS5. Just vector similarity. For a personal memory corpus (likely <100 files, <1000 chunks), brute-force cosine over all chunks is fast enough — OpenClaw itself falls back to this when the sqlite-vec extension isn't available.
+OpenClaw needs vector search because it indexes thousands of files across multiple workspaces for multiple agents. Casper Claw has one user, one agent, one file.
 
-### 8.4 SQLite Schema
+### 8.3 Example MEMORY.md
 
-Minimal. Two tables.
+```markdown
+# Memory
 
-```sql
-CREATE TABLE files (
-  path TEXT PRIMARY KEY,
-  hash TEXT NOT NULL,           -- SHA-256 of file content
-  mtime INTEGER NOT NULL
-);
+## User
+- Name: Alex
+- Timezone: America/New_York
+- Prefers concise responses
 
-CREATE TABLE chunks (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  path TEXT NOT NULL,
-  start_line INTEGER NOT NULL,
-  end_line INTEGER NOT NULL,
-  text TEXT NOT NULL,
-  embedding BLOB NOT NULL,     -- Float32Array as raw bytes (not JSON)
-  FOREIGN KEY (path) REFERENCES files(path) ON DELETE CASCADE
-);
+## Preferences
+- GitHub: uses gautamarora org
+- Coffee order: oat milk latte
+- Preferred model for code: claude-sonnet
+
+## Active Projects
+- Casper Claw — WhatsApp bot project, TS-based
+- Q1 planning — deadline March 15
+
+## Key Decisions
+- 2026-02-15: Decided to use Baileys instead of whatsapp-web.js
+- 2026-02-16: Chose pi-coding-agent over building custom agent loop
 ```
 
-That's it. No FTS5, no embedding cache table, no metadata table. When a file changes (hash differs), delete its old chunks and reinsert. When a file is deleted, `ON DELETE CASCADE` cleans up.
+### 8.4 Future: If the File Gets Too Big
 
-Embeddings are stored as raw `Float32Array` buffers (6KB per chunk at 1536 dims) instead of JSON strings (~12KB per chunk). For a personal corpus this doesn't matter much, but it's simpler to work with in code.
-
-### 8.5 Chunking
-
-Same approach as OpenClaw but hardcoded instead of configurable:
-
-```typescript
-const CHUNK_CHARS = 1600;     // ~400 tokens
-const OVERLAP_CHARS = 320;    // ~80 tokens
-
-function chunkFile(path: string, content: string): Chunk[] {
-  const lines = content.split("\n");
-  const chunks: Chunk[] = [];
-  let start = 0;
-  let charCount = 0;
-
-  for (let i = 0; i < lines.length; i++) {
-    charCount += lines[i].length + 1;
-    if (charCount >= CHUNK_CHARS || i === lines.length - 1) {
-      chunks.push({
-        path,
-        startLine: start + 1,
-        endLine: i + 1,
-        text: lines.slice(start, i + 1).join("\n"),
-      });
-      // Walk back for overlap
-      let overlapChars = 0;
-      let overlapStart = i;
-      while (overlapStart > start && overlapChars < OVERLAP_CHARS) {
-        overlapChars += lines[overlapStart].length + 1;
-        overlapStart--;
-      }
-      start = overlapStart + 1;
-      charCount = 0;
-    }
-  }
-  return chunks;
-}
-```
-
-### 8.6 Memory Tools
-
-Two tools exposed to the agent:
-
-```typescript
-// memory_search: Find relevant memories
-{
-  name: "memory_search",
-  description: "Search long-term memory for relevant information.",
-  parameters: {
-    type: "object",
-    properties: {
-      query: { type: "string", description: "What to search for" },
-    },
-    required: ["query"],
-  },
-  execute: async (id, { query }) => {
-    await indexer.syncIfNeeded();                    // Re-index changed files
-    const queryVec = await embed(query);             // Embed query
-    const results = indexer.search(queryVec, 5);     // Top 5 by cosine sim
-    return { content: [{ type: "text", text: formatResults(results) }] };
-  },
-}
-
-// memory_get: Read a specific memory file (or range of lines)
-{
-  name: "memory_get",
-  description: "Read a memory file. Use after memory_search to see full context.",
-  parameters: {
-    type: "object",
-    properties: {
-      path: { type: "string", description: "Relative path within memory dir" },
-      from: { type: "number", description: "Start line (1-indexed)" },
-      lines: { type: "number", description: "Number of lines to read" },
-    },
-    required: ["path"],
-  },
-  execute: async (id, { path: filePath, from, lines }) => {
-    const content = readMemoryFile(filePath, from, lines);
-    return { content: [{ type: "text", text: content }] };
-  },
-}
-```
-
-### 8.7 Sync Strategy
-
-**Lazy sync on search** — no file watchers, no chokidar dependency. When `memory_search` is called:
-
-1. List all `.md` files in the memory dir
-2. For each file, compare `fs.statSync(file).mtimeMs` against stored mtime
-3. If changed: re-read, re-chunk, re-embed, update in SQLite
-4. If new file: chunk, embed, insert
-5. If file deleted: delete from SQLite (cascade removes chunks)
-
-This is fast because the corpus is small and embedding calls are batched. OpenAI's embedding API accepts arrays of texts, so we send all new/changed chunks in one call.
-
-### 8.8 Memory Lifecycle
-
-```
-1. Startup:
-   - Nothing. Index is built lazily on first memory_search.
-
-2. During conversation:
-   - Agent learns something → writes to memory/YYYY-MM-DD.md via write tool
-   - Agent needs to recall → calls memory_search → lazy sync → vector search
-
-3. Pre-compaction flush:
-   - Session approaching context limit
-   - Gateway injects a silent prompt: "Store important memories from this conversation"
-   - Agent writes to memory/YYYY-MM-DD.md
-   - pi-coding-agent compacts the session (summarizes old turns)
-   - Memories survive in files, searchable via memory_search later
-
-4. Index corruption / stale:
-   - Delete .index.sqlite → rebuilds on next search
-```
+If MEMORY.md grows beyond what fits comfortably in context (~20KB), the simplest upgrade is to split it into a few files (`MEMORY.md`, `MEMORY-archive.md`) and add a lightweight search. But that's a v2 problem. Start with the simplest thing.
 
 ---
 
 ## 9. Session Management
 
-### 9.1 Design Philosophy
+A session is the current conversation. `pi-coding-agent`'s `SessionManager` handles all the mechanics (JSONL persistence, message appending, compaction). We just tell it which file to use.
 
-OpenClaw's session system handles multi-agent, multi-channel, multi-account routing with complex key generation (`agent:<id>:<channel>:<kind>:<peerId>:thread:<threadId>`), write locking with 10s timeouts, atomic file renames, 45s in-memory caches, session branching, topic splitting, and maintenance policies (prune after 30 days, cap 500 entries, rotate at 10MB).
-
-Casper Claw has one agent, one channel. We delegate to `pi-coding-agent`'s `SessionManager` which already handles JSONL persistence. We just need to tell it which file to use.
-
-### 9.2 Session Storage
-
-pi-coding-agent's `SessionManager` stores sessions as JSONL files. We just pick the file path:
+### 9.1 One JSONL File Per Sender
 
 ```
 sessions/
 ├── 1234567890.jsonl         # Per-sender (JID without @s.whatsapp.net)
 ├── 9876543210.jsonl
-└── _main.jsonl              # Heartbeat / system session
+└── _heartbeat.jsonl         # Heartbeat session
 ```
-
-Each file is managed entirely by `SessionManager.open(filePath)`. It handles:
-- Appending messages (user, assistant, tool_use, tool_result)
-- Building the message array for LLM calls
-- Compaction (summarizing old turns when context gets full)
-- Reading back the session on process restart
-
-We don't wrap, cache, or lock these files — `SessionManager` does it.
-
-### 9.3 Session Key → File Path
 
 ```typescript
-function sessionFilePath(jid: string, config: CasperConfig): string {
-  if (config.session.scope === "global") {
-    return path.join(config.session.dir, "_main.jsonl");
-  }
-  const senderId = jid.split("@")[0];   // "1234567890"
-  return path.join(config.session.dir, `${senderId}.jsonl`);
+function sessionFile(jid: string): string {
+  const senderId = jid.split("@")[0];
+  return path.join("./sessions", `${senderId}.jsonl`);
 }
 ```
 
-### 9.4 Session Reset
+`SessionManager.open(filePath)` handles everything: appending messages, building the message array for LLM calls, persisting to disk, and reading it back on restart.
 
-Two reset modes, checked before each agent run:
+### 9.2 Compaction
+
+When the context window fills up, `pi-coding-agent` automatically compacts the session — summarizes old turns into a shorter summary, keeps recent turns intact. We don't implement this ourselves.
+
+### 9.3 Starting Fresh
+
+The user can send `/new` to start a fresh conversation. The gateway renames the old file and the next message creates a new one.
 
 ```typescript
-function shouldReset(sessionFile: string, config: CasperConfig["session"]): boolean {
-  if (!config.reset) return false;
-
-  const stat = fs.statSync(sessionFile, { throwIfNoEntry: false });
-  if (!stat) return false;  // No session file yet
-
-  const lastModified = stat.mtimeMs;
-  const now = Date.now();
-
-  if (config.reset.mode === "idle") {
-    const idleMs = (config.reset.idleMinutes ?? 60) * 60_000;
-    return now - lastModified > idleMs;
+if (msg.text.trim() === "/new") {
+  const file = sessionFile(msg.jid);
+  if (fs.existsSync(file)) {
+    fs.renameSync(file, file.replace(".jsonl", `.${Date.now()}.bak.jsonl`));
   }
-
-  if (config.reset.mode === "daily") {
-    const resetHour = config.reset.atHour ?? 4;
-    const lastDate = new Date(lastModified);
-    const today = new Date();
-    today.setHours(resetHour, 0, 0, 0);
-    // Reset if the session file was last written before today's reset hour
-    return lastDate < today && new Date() >= today;
-  }
-
-  return false;
-}
-
-// Reset = rename old file, start fresh
-function resetSession(sessionFile: string): void {
-  const backup = sessionFile.replace(".jsonl", `.${Date.now()}.jsonl`);
-  fs.renameSync(sessionFile, backup);
+  await wa.sendMessage(msg.jid, "Fresh conversation started.");
+  return;
 }
 ```
-
-Also supports `/new` and `/reset` as text triggers — if the incoming message matches, reset the session before running the agent.
-
-### 9.5 Compaction
-
-Handled entirely by `pi-coding-agent`. When the context window fills up:
-
-1. **Pre-compaction memory flush**: Before compacting, the gateway runs a silent agent turn with the prompt "Store important memories from this conversation to memory files." The agent writes to `memory/YYYY-MM-DD.md`. This ensures long-term knowledge is preserved before old turns are summarized away.
-
-2. **Compaction**: `SessionManager.compact()` summarizes old conversation turns into a shorter summary, freeing context space. The session continues with the summary + recent turns.
-
-3. **If still too long**: The gateway resets the session and tells the user the conversation was too long.
-
-We don't implement our own compaction logic. We call `session.compact()` and let the library handle it.
 
 ---
 
@@ -1362,33 +1105,29 @@ The LLM sees the error and can decide how to proceed (retry, try alternative, in
 
 **Milestone**: Send a message on WhatsApp, get an AI response with file/exec tool access.
 
-### Phase 2: Memory + Heartbeat (Week 2)
+### Phase 2: Heartbeat + Memory (Week 2)
 
-9. **Memory indexer** — SQLite schema, chunking, OpenAI embeddings, cosine search (single file)
-10. **Memory tools** — memory_search, memory_get tool definitions
-11. **Heartbeat runner** — Interval timer, HEARTBEAT.md, HEARTBEAT_OK suppression
-12. **Active hours** — Quiet hours for heartbeat
-13. **Pre-compaction flush** — Memory flush hook before session compaction
+9. **Heartbeat runner** — Interval timer, HEARTBEAT.md, HEARTBEAT_OK suppression
+10. **Active hours** — Quiet hours for heartbeat
+11. **MEMORY.md** — System prompt instructions for reading/writing memory file
+12. **Workspace files** — AGENTS.md, SOUL.md injection into system prompt
 
-**Milestone**: Agent remembers things across sessions. Heartbeat checks in periodically.
+**Milestone**: Agent remembers things via MEMORY.md. Heartbeat checks in periodically.
 
 ### Phase 3: SDK Integrations (Week 3)
 
-17. **Web tools** — web_search (Brave), web_fetch
-18. **GitHub tool** — Octokit-based PR/issue/run management
-19. **Additional integrations** — Notion, or others based on user needs
-20. **Context management** — Pre-compaction memory flush, session compaction
+13. **Web tools** — web_search (Brave), web_fetch
+14. **GitHub tool** — Octokit-based PR/issue/run management
+15. **Additional integrations** — Notion, or others based on user needs
 
 **Milestone**: Agent can search the web, manage GitHub, and gracefully handle long conversations.
 
 ### Phase 4: Polish (Week 4)
 
-21. **Group chat support** — Mention-based triggers in WhatsApp groups
-22. **Media handling** — Image/audio/document receipt and processing
-23. **Typing delay** — Human-like response timing
-24. **Logging** — Structured logging to file
-25. **Error recovery** — Graceful handling of all failure modes
-26. **Session reset** — Daily and idle-based session reset
+16. **Group chat support** — Mention-based triggers in WhatsApp groups
+17. **Media handling** — Image/audio/document receipt and processing
+18. **Typing delay** — Human-like response timing
+19. **Logging + error recovery** — Structured logging, graceful failure handling
 
 **Milestone**: Production-ready personal assistant.
 
